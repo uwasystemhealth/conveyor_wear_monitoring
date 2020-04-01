@@ -1,0 +1,2232 @@
+'---
+title: "model-selection.rmd"
+author: "Joanna Sikorska & Callum Webb
+date: "20/02/2020"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Purpose
+
+This notebook summarises the routines used to do model selection on the data created in the modelling-data-preparation notebook.
+
+## Include files
+
+```{r, warning = FALSE, message = FALSE}
+
+remove(list=ls())
+
+library(dplyr)    #version 0.8.4
+library(tidyr)    #version 1.0.2
+library(ggplot2)  #version 3.3.0
+library(MASS)     #version 7.3-51.5
+library(purrr)    #version 0.3.3
+library(car)      #version 3.0-6
+library(caret)    #version 6.0-85
+library(glmulti)  #version 1.0.7.1
+library(glmnet)   #version 3.0-2
+library(cowplot)  #version 1.0.0
+library(viridis)        #verion 0.5.1
+library(gridExtra)      #version 2.3
+library(formula.tools)  #version 1.7.1
+#library(MatrixModels)
+library(vip)        #version 0.2.1
+library(gglasso)    #version 1.4
+library(stringr)    #version 1.4.0
+
+
+```
+
+## Read in the data 
+
+The complete learning table:
+
+```{r ReadInData}
+#remove(list=ls())
+
+wear_data <- as.data.frame(readRDS("../../data/output/modelling/model-data.rds") %>%
+  mutate(conveyor_duty = as.factor(conveyor_duty)))
+
+head(wear_data)
+
+```
+
+
+We will focus on 1D throughput based mean wear rates.
+We expect mean wear rate to be more predictable.
+
+```{r Add transformations to dataframe and filter throughput data}
+
+wear_data$beltsp_sqr<-wear_data$belt_speed_ms*wear_data$belt_speed_ms
+wear_data$len_inv<-1/wear_data$belt_length_m
+wear_data$width_inv<-1/wear_data$belt_width_mm
+
+wear_util_mean <- wear_data %>%
+  filter(metric == "mm/MT",
+         wear_type == "mean") %>%
+  arrange(pool)
+head(wear_util_mean)
+
+wear_util_orig<- wear_util_mean
+
+xlevs <- lapply(wear_util_mean[,sapply(wear_util_mean, is.factor), drop = F], function(j){
+  levels(j)
+})
+```
+
+# Calculate the means, variances & std errors of the predicted variables
+
+```{r Calculate means & variances}
+variances<-wear_data %>%
+  group_by(wear_type,metric) %>%
+  summarize(mean_metric=mean(rate),var_metric=var(rate),stderr_metric=sqrt(var_metric)/n())
+variances
+
+
+```
+
+### Create a data frame to store all of our results
+
+```{r Setup results dataframe}
+
+results<-data.frame(metric=character(),
+                    wear_type=character(),
+                    model_name=character(),
+                    model_par_list=character(),
+                    folds=integer(),
+                    repeats=integer(),
+                    PRMSE=double(),
+                    PRMSE.SD=double(),
+                    P.Rsqr=double(),
+                    P.Rsqr.SD=double(),
+                    df=integer(),
+                    R2=double(),
+                    AdjR2=double(),
+                    stringsAsFactors = FALSE)
+
+```
+
+
+# DEFINE VARIABLES
+
+```{r Define processing options}
+
+#Remember to change both lines to be the same!
+
+#All predictors
+all_pred<-    "rate~ conveyor_duty +v1 +belt_strength_kNpm +drop_height_m  +perc_fines + belt_speed_ms+ beltsp_sqr +len_inv  + width_inv"
+all_pred_list <- c("conveyor_duty","v1","belt_strength_kNpm","drop_height_m","perc_fines","belt_speed_ms","beltsp_sqr","len_inv", "width_inv")
+
+
+# Untransformed predictors
+orig_pred<- "rate~ conveyor_duty  +belt_width_mm  +belt_length_m  +belt_strength_kNpm  +belt_speed_ms  +drop_height_m  +perc_fines"
+orig_pred_list<-c("conveyor_duty", "belt_width_mm","belt_length_m","belt_strength_kNpm","belt_speed_ms","drop_height_m","perc_fines")
+
+
+# Only simple predictors
+simple_pred<- "rate~conveyor_duty   +belt_strength_kNpm  +belt_speed_ms  +drop_height_m  +perc_fines + len_inv  + width_inv"
+simple_pred_list<-c("conveyor_duty","belt_strength_kNpm","belt_speed_ms","drop_height_m","perc_fines","len_inv","width_inv")
+
+
+# Only numeric predictors 
+numeric_pred_list <- c("v1","belt_strength_kNpm","drop_height_m","perc_fines","belt_speed_ms","beltsp_sqr","len_inv", "width_inv","belt_width_mm","belt_length_m","load_freq")
+
+
+
+
+# Set number of folds and repeats to be used for cv process later on.
+k <- 10
+n_reps <- 50
+
+normalize<-TRUE
+
+```
+
+```{r Normalize Data}
+
+# Only numeric variables can be normalised
+# Skiplist is the list of variables that are either not used or can not be normalised so are removed from the dataset prior to normalization
+# Keeplist is the list of variables that are to remain
+
+
+rawdata<-wear_util_mean
+
+scaledata<-function(rawdata,skiplist,keeplist=numeric_pred_list){
+  
+  other_cols<-rawdata[,skiplist]
+  toscale<- rawdata[,c(keeplist)]
+  
+  mydata_scaled <- toscale %>%
+    
+    as.matrix() %>%
+    scale() %>%
+    as.data.frame() 
+  
+  mydata_scaled<- cbind(mydata_scaled,other_cols)
+  
+  return(mydata_scaled)
+  
+} 
+
+
+if(normalize){
+ wear_util_mean<-scaledata(wear_util_mean,
+                           c("pool","conveyor_duty","metric","wear_type","r2","std_error","maxdate",
+                            "original_duty","position","TotalMTFines","TotalMTLump","std_err","conveyor_id","rate"),
+                           numeric_pred_list)
+}
+  
+head(wear_util_mean)
+
+```
+
+
+
+# MODELLING SETUP
+
+## Setup up Repeated Cross Validation
+
+To perform cross-validation, we need to partition the data into k folds, with the following constraints:
+
+* A conveyor can't appear in more than one fold
+* Each level of a categorical variable must appear in at least two folds
+
+The first constraint is to ensure that the performance estimate isn't optimistically biased by the same conveyor appearing in a train and test partition.
+
+The second constraint ensures that for any test partition, there cannot exist categorical explanatory variables that did not appear in training.
+
+This is effectively an assignment problem.Each record should be randomly assigned to one of k partitions, respecting the above constraints.
+
+The simplest approach is to randomly assign conveyors to partitions, and check that the resulting assignment respects the categorical variable constraint.  If not, discard the assignment and repeat.
+
+The same folds are used for all models so the folds only need to be created once.
+
+The following function returns row indexes into the modelling data for k folds and n repeats.
+
+```{r Define cv functions}
+
+#' Generate a named list of row index vectors into model_data for cross validation
+#' Each element of the returned list is a cross-validation partition or "fold",
+#' and the union of all the partitions is 1:nrow(model_data)
+#'
+#' Ensures that each conveyor_duty appears in at least two partitions.
+#' 
+#' @param model_data the modelling data
+#' @param k number of folds for cross validation
+#' @param whichrpt is the number of the repeat that is calling this function.  Used for naming folds.
+
+generate_folds <- function(model_data, k = 10, whichrpt) {
+  valid_assignment <- FALSE
+  while (!valid_assignment) {
+    # Get all conveyor ids in random order - each id will only appear once in the list
+    conveyors <- unique(model_data$conveyor_id) %>%
+      sample()
+  
+    # Form a dataframe mapping conveyors to partitions by recycling 1:k - this assigns conveyor_ids to a fold
+    assignment <- data.frame(conveyor_id = conveyors,
+                             fold = rep_len(1:k, length(conveyors)),
+                             stringsAsFactors = FALSE)
+    
+    # Check the assignment is valid
+    # For each element in the dataset, add the fold it belongs to.
+    assignment <- model_data %>%
+      left_join(assignment, by = "conveyor_id")
+    
+    # Currently, we only need to check that each conveyor_duty value appears in at least two different folds
+    valid_duty <- all(
+      assignment %>%
+        group_by(conveyor_duty) %>%
+        summarise(n_folds = length(unique(fold))) %>%
+        pull(n_folds) > 1
+      )
+    valid_assignment <- valid_duty
+  }
+  
+  # Return a list of length k, where each element of the list is a vector of row indexes into model_data for the 
+  # test data of that fold.
+  # We will also sort the row indices in each fold to better enable comparisons between folds s
+  # (e.g. check if we have duplicates)
+  
+  assignment %>% 
+    mutate(index = row_number()) %>%
+    group_by(fold) %>%
+    arrange(fold) %>%
+    summarise(indexes = list(sort(index))) %>%
+    pull(indexes) %>%
+    setNames(paste0("Rpt",whichrpt,".Fold", 1:length(.)))
+}
+
+#' It can be shown that the integers produced enumerate every row of the modelling data, and the two constraints are respected.
+#' We would like to perform repeated cross-validation, which requires this process to be repeated n times.
+#' This is encapsulated in the following function, which returns a nested list of row indexes for each (repeat, fold) pair.
+
+#' Repeated cross validation: 
+#' Nests the result of generate_folds into another list of n repeats
+#'
+#' @param model_data modelling data
+#' @param n number of cross validation repeats
+#' @param k number of cross validaion folds
+
+repeated_folds <- function(model_data, n = 5, k = 10) {
+  fold_data<- list()
+  #repeats <- vector("list", n)
+  #fold_names <- list()
+  for (i in seq_len(n)) {
+      thisfold <- generate_folds(model_data, k,i)
+      fold_data<-c(fold_data,thisfold)
+      
+    }  
+  return(fold_data)
+}
+
+
+# Calculate the cv error from the 1D list of errors calculated for every fold and repeat and generated by the custom cv functions.
+
+calc_tot_cverror <- function(errors) {
+    loops<-length(errors)    
+    cv_rmse <- mean(sapply(X=1:loops,function(X) {sqrt(mean(errors[[X]]^2))}))
+                   
+  return(cv_rmse)
+}
+
+calc_cv_error_var <- function(errors) {
+    loops<-length(errors)    
+    cv_var <- var(sapply(X=1:loops,function(X) {sqrt(mean(errors[[X]]^2))}))
+}
+```
+
+## Generate the folds
+
+```{r Generate folds}
+
+# Because we have the same records in wear_util_max and wear_util_mean, we can arbitrarily use
+# wear_util_max to generate one set of CV folds, which we will use for each modelling approach
+
+set.seed(1)
+
+cvfolds <- repeated_folds(wear_util_mean, n = n_reps, k = k)
+
+# this is the list of training data for each fold
+traindata<-lapply(cvfolds,function (x) {as.integer(seq(1,length(wear_util_mean$pool),1))[-x]})
+
+```
+
+# MEAN WEAR MODELS
+
+## Mean Wear vs Throughput (mm/MT) Models 
+
+### CV: Null Hypothesis Model
+
+```{r Null model mean mm/MT}
+
+mydata<-wear_util_mean
+
+tc_lm<-trainControl(method="repeatedcv",
+                    repeats=n_reps,
+                    number=k,
+                    indexOut=cvfolds,
+                    index=traindata,
+                    savePredictions = TRUE)
+
+nested_lm_mean_null<-train(y=mydata$rate,
+                      x=mydata[],
+                      trControl=tc_lm,
+                      method = "null",
+                      metric="RMSE",
+                      preProcess = c("center","scale"))
+
+summ<-summary(nested_lm_mean_null)
+cvmod<-nested_lm_mean_null
+
+results<-rbind(results, data.frame(metric="mm/MT",
+                                    wear_type="mean",
+                                    model_name="Null Model",
+                                    model_par_list="rate~constant",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=-1,
+                                    P.Rsqr=-1,
+                                    P.Rsqr.SD=-1,
+                                    sigma=-1,
+                                    df=1,
+                                    R2=-1,
+                                    AdjR2=-1,
+                                    stringsAsFactors = FALSE))
+
+
+
+nested_lm_mean_null$results
+
+```
+
+
+### Full Model
+
+```{r Full Model mean mm/MT}
+mydata<-wear_util_mean
+
+nested_lm_meanMT<-train(y=mydata$rate,
+                      x=mydata[,all_pred_list],
+                      trControl=tc_lm,
+                      method = "lm",
+                      metric="RMSE",
+                      preProcess = c("center","scale")
+                      
+                 )
+
+summ<-summary(nested_lm_meanMT)
+summ
+cvmod<-nested_lm_meanMT
+
+results<-rbind(results, data.frame(metric="mm/MT",
+                                    wear_type="mean",
+                                    model_name="Full Model - cv",
+                                    model_par_list="All variables + transformations",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+nested_lm_meanMT$results
+
+rp.all<-residualPlot(nested_lm_meanMT$finalModel,variable="fitted",id=TRUE)
+
+
+```
+
+#### Plot of model free (filter method) variable importance
+This provides some insight into the relative importances of different variables, but using the model-free method
+
+```{r Plot of model free variable importance for mean mm/MT}
+
+vidata_lm<-filterVarImp(y=mydata$rate,x=mydata[,all_pred_list],nonpara=FALSE)
+vidata_lm
+vidata_lm$varnames<-rownames(vidata_lm)
+
+viplot_lm<-ggplot(vidata_lm, aes(x=reorder(varnames, Overall), weight=Overall)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, Model Free") +
+  xlab("") + 
+  coord_flip()
+viplot_lm
+
+
+```
+
+#### Plot of variable importance using alternative model-free method
+
+```{r Plot of VI for Full model mean mm/MT - alternative method}
+
+# Having trouble extracting this from the repeated cv object, so rerunning the final model
+nested_lm_mean_MT_final <- lm(as.formula(all_pred),data=mydata)
+
+#model-free
+vidata_lm<-vi(nested_lm_mean_MT_final,method="firm",scale=TRUE, ice=TRUE)
+vidata_lm
+vidata_lm$varnames<-rownames(vidata_lm)
+
+viplot_lm<-ggplot(vidata_lm, aes(x=reorder(Variable, Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, MLR (All) Model") +
+  xlab("") + 
+  coord_flip()
+viplot_lm
+
+
+```
+
+### Untransformed simple predictors
+
+```{r Untransformed predictors Model mean mm/MT}
+mydata<-wear_util_mean
+
+nested_lm_meanMT_orig<-train(y=mydata$rate,
+                      x=mydata[,orig_pred_list],
+                      trControl=tc_lm,
+                      method = "lm",
+                      preProcess = c("center","scale"),
+                      metric="RMSE"
+                 )
+
+summ<-summary(nested_lm_meanMT_orig)
+summ
+cvmod<-nested_lm_meanMT_orig
+
+results<-rbind(results, data.frame(metric="mm/MT",
+                                    wear_type="mean",
+                                    model_name="Basic variables - cv",
+                                    model_par_list="Basic variables",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+nested_lm_meanMT_orig$results
+
+rp.all<-residualPlot(nested_lm_meanMT_orig$finalModel,variable="fitted",id=TRUE)
+
+
+```
+
+
+### Simple transformed predictors
+
+```{r Simple transformed predictors Model mean mm/MT}
+
+mydata<-wear_util_mean
+
+nested_lm_meanMT_simple<-train(y=mydata$rate,
+                      x=mydata[,simple_pred_list],
+                      trControl=tc_lm,
+                      preProcess = c("center","scale"),
+                      method = "lm",
+                      metric="RMSE"
+                 )
+
+summ<-summary(nested_lm_meanMT_simple)
+summ
+cvmod<-nested_lm_meanMT_simple
+
+results<-rbind(results, data.frame(metric="mm/MT",
+                                    wear_type="mean",
+                                    model_name="Basic transfomred variables - cv",
+                                    model_par_list="Basic transformed variables",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+nested_lm_meanMT_simple$results
+
+rp.all<-residualPlot(nested_lm_meanMT_simple$finalModel,variable="fitted",id=TRUE)
+
+
+```
+
+#### Plot the variable importance for simple predictors model
+
+```{r VI for simple model mean mm/MT}
+
+#model-free
+vidata_lmsimp<-vi(nested_lm_meanMT_simple,method="firm",scale=TRUE, ice=TRUE)
+
+
+viplot_lmsimp<-ggplot(vidata_lmsimp, aes(x=reorder(Variable, Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, MLR (Simple) Model") +
+  xlab("") + 
+  coord_flip()
+viplot_lmsimp
+
+
+```
+
+
+
+### Model with only conveyor_duty variable
+
+```{r Conveyor duty only mean mm/MT}
+
+mydata<-wear_util_mean
+x<-mydata[,c("conveyor_duty")]
+
+nested_lmcd_mean_MT<-train(rate~conveyor_duty,
+                      data=mydata,
+                      trControl=tc_lm,
+                      method = "lm",
+                      preProcess = c("center","scale"),
+                      metric="RMSE")
+
+summ<-summary(nested_lmcd_mean_MT)
+summ
+plot(varImp(nested_lmcd_mean_MT))
+nested_lmcd_mean_MT$results
+
+cvmod<-nested_lmcd_mean_MT
+
+results<-rbind(results, data.frame(metric="mm/MT",
+                                    wear_type="mean",
+                                    model_name="rate ~ conveyor_duty",
+                                    model_par_list="conveyor_duty",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+
+
+```
+
+### Model with v1 predictor only
+
+```{r V1 only model mean mm/MT}
+
+mydata<-wear_util_mean
+nested_lmv1_mean_MT<-train(rate~v1,
+                           data=mydata,
+                            trControl=tc_lm,
+                            method = "lm",
+                            preProcess = c("center","scale"),
+                            metric="RMSE")
+
+summ<-summary(nested_lmv1_mean_MT)
+cvmod<-nested_lmv1_mean_MT
+nested_lmv1_mean_MT$results
+results<-rbind(results, data.frame(metric="mm/MT",
+                                    wear_type="mean",
+                                    model_name="rate ~ v1",
+                                    model_par_list="v1",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+
+rp.v1<-residualPlot(nested_lmv1_mean_MT$finalModel,variable="fitted",id=TRUE)
+summary(nested_lmv1_mean_MT)
+```
+
+### Mean mm/MT, duty+v1 only
+
+```{r Duty + V1 only mean mm/MT}
+
+mydata<-wear_util_mean
+
+
+nested_lmv1cd_mean_MT<-train(y=mydata$rate,
+                      x=mydata[,c("conveyor_duty","v1")],
+                      trControl=tc_lm,
+                      method = "lm",
+                      preProcess = c("center","scale"),
+                      metric="RMSE")
+
+summ<-summary(nested_lmv1cd_mean_MT)
+cvmod<-nested_lmv1cd_mean_MT
+nested_lmv1cd_mean_MT$results
+results<-rbind(results, data.frame(metric="mm/MT",
+                                    wear_type="mean",
+                                    model_name="rate ~ conveyor_duty+v1",
+                                    model_par_list="v1 + conveyor duty",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+
+rp.v1cd<-residualPlot(nested_lmv1cd_mean_MT$finalModel,variable="fitted",id=TRUE)
+summ
+
+```
+
+### StepWise Model Selection
+
+```{r Stepwise Model mean mm/MT}
+
+x<-mydata[,all_pred_list]
+
+nested_steplm_mean_MT<-train(y=mydata$rate,
+                      x=x,
+                      trControl=tc_lm,
+                      method = "lmStepAIC",
+                      k=2,
+                      trace=FALSE,
+                      preProcess = c("center","scale"),
+                      metric="RMSE")
+
+summ<-summary(nested_steplm_mean_MT)
+cvmod<-nested_steplm_mean_MT
+nested_steplm_mean_MT$results
+results<-rbind(results, data.frame(metric="mm/MT",
+                                    wear_type="mean",
+                                    model_name="StepWise model selection",
+                                    model_par_list="All variables",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+
+plot(varImp(nested_steplm_mean_MT, scale=TRUE))
+summ
+rp.stpw<-residualPlot(nested_steplm_mean_MT$finalModel,variable="fitted",id=TRUE)
+
+```
+
+#### Variable importance for StepWise Selection
+
+```{r VI for Stepwise Model mean mm/MT}
+
+#nested_lm_mean$resample
+vidata_steplm_MT<-vi(nested_steplm_mean_MT,method="firm",scale=TRUE, ice=TRUE)
+
+viplot_steplm_MT<-ggplot(vidata_steplm_MT, aes(x=reorder(Variable, Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, MLR(Step) Model") +
+  xlab("") + 
+  coord_flip()
+viplot_steplm_MT
+
+
+```
+
+### Weighted Averaging - Glmulti 
+
+```{r Glmulti model mean mm/MT}
+
+mydata<-wear_util_mean
+
+x<-model.matrix(as.formula(all_pred),mydata[,c("rate",all_pred_list)],xlev=1)
+y<-mydata$rate
+
+cvg_mod <- function(model_data=mydata,cvfolds,modnum=10) {
+  gloops<-length(cvfolds)
+  errors<- vector("list", gloops)
+  Rsqr<- vector("list", gloops)
+  mods<- vector("list", gloops)
+  for (i in 1:gloops) {
+        test_idx <- cvfolds[[i]]
+        test_norm <- preProcess(model_data[test_idx, c("rate",all_pred_list)])
+        test_df<- predict(test_norm,model_data[test_idx, c("rate",all_pred_list)])
+        train_df <- predict(test_norm,model_data[-test_idx, c("rate",all_pred_list)])
+        glmod<-glmulti(y="rate",
+                       xr=all_pred_list,
+                       data=train_df,
+                       crit="aic",
+                       level=1,
+                       fitfunction="lm",
+                       plotty=FALSE,
+                       report=FALSE,
+                       includeobjects = TRUE,
+                       confsetsize = modnum)
+        
+        glpred<-predict.glmulti(glmod,select="all",newdata = test_df)
+        
+        errors[[i]] <- test_df$rate - glpred$averages
+        #Get Rsqr from final model
+        Rsqr[[i]]<-postResample(obs=test_df$rate,pred=glpred$averages)[[2]]
+  }
+  rtn_this<-list(errors,mods,Rsqr)
+  return(rtn_this)
+}
+
+getmods<- cvg_mod(mydata,cvfolds,50)
+get_errors<-getmods[[1]]
+
+cv_g_rmse <- calc_tot_cverror(get_errors)
+cv_g_rmse_var <- calc_cv_error_var(get_errors) 
+
+cv_g_aveRsqr<-mean(unlist(getmods[[3]]))
+cv_g_varRsqr<-var(unlist(getmods[[3]]))
+
+myresults<-data.frame(parameter="none", 
+                      RMSE= cv_g_rmse,
+                      Rsqr=cv_g_aveRsqr,
+                      MAE = -999,
+                      RMSESD=sqrt(cv_g_rmse_var),
+                      RsqrSD=sqrt(cv_g_varRsqr),
+                      MAESD=-999)
+
+
+myresults
+```
+
+#### Rerun Weighted Averaging on all data
+
+```{r}
+# Rerun model on all data
+finalglModel<-glmulti(y="rate",
+                       xr=all_pred_list,
+                       data=mydata,
+                       crit="aic",
+                       level=1,
+                       fitfunction = "lm",
+                       plotty=FALSE,
+                       report=FALSE,
+                       includeobjects = TRUE,
+                       confsetsize = 100)
+
+predictions<-predict.glmulti(finalglModel,select=10.0)
+gldata<-postResample(pred=predictions$averages,obs=mydata$rate)  
+gldata
+coef(finalglModel,select=10.0)
+
+goodmodels<-weightable(finalglModel,select=10.0)
+goodmodels$delta<-goodmodels$aic-min(goodmodels$aic)
+
+
+results<-rbind(results, data.frame(metric="mm/MT",
+                                    wear_type="mean",
+                                    model_name="Model Averaging",
+                                    model_par_list="All variables",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=myresults[[2]],
+                                    PRMSE.SD=myresults[[5]],
+                                    P.Rsqr=myresults[[3]],
+                                    P.Rsqr.SD=myresults[[6]],
+                                    sigma=-1,
+                                    df=12,
+                                    R2=gldata[[2]],
+                                    AdjR2=1-(1-gldata[[2]])* (164/143),
+                                    stringsAsFactors = FALSE))
+
+
+```
+
+#### Show best models with AIC <=2 and AIC <=10
+
+```{r Show best models}
+bestmodels<-goodmodels[goodmodels$delta<=2.0,]
+bestmodels
+
+bestmodels<-goodmodels[goodmodels$delta<=10.0,]
+bestmodels
+
+```
+
+
+#### Variable importance
+
+```{r VI for Glmulti mean mm/MT}
+
+w<-bestmodels
+all_terms<- all_pred_list
+getTermsArray<- function(all_terms,formula_in,weight){
+  #browser()
+  newformlist<-data.frame(matrix(ncol=length(all_terms),nrow=1))
+  colnames(newformlist)<- all_terms
+  #newEntry<- vector("list",length(all_terms))
+  for(i in 1:length(all_terms)){
+      myterms<- get.vars(formula_in)
+      newformlist[as.character(all_terms[i])][1]=sum(grepl(all_terms[i],myterms))*weight
+    }
+  return(newformlist)
+}
+
+pred.gl.matrix<-data.frame(matrix(ncol=length(all_terms),nrow=0))
+colnames(pred.gl.matrix)<- all_terms
+
+for(i in 1:length(w$model)){
+  pred.gl.matrix<-rbind(pred.gl.matrix, 
+              getTermsArray(all_terms,
+                            as.formula(as.character(w$model[[i]])),w$weights[[i]]))
+  
+}
+
+glmulti.imp<-data.frame(Variable=as.character(all_terms),Importance=as.vector(colSums(pred.gl.matrix)))
+
+viplot_glmulti_MT<-ggplot(glmulti.imp, aes(x=reorder(Variable, Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, Weighted-Avg Model") +
+  xlab("") + 
+  coord_flip()
+viplot_glmulti_MT
+
+
+```
+
+
+### Lasso Model, min lambda
+
+```{r Lasso model mean mm/MT}
+
+mydata<-wear_util_mean[,c("rate",all_pred_list)]
+rate_var <-var(mydata$rate)
+
+#scale data
+mydata_scaled <- mydata %>%
+  subset(select=-conveyor_duty) %>%
+  as.matrix() %>%
+  scale() %>%
+  as.data.frame() 
+
+mydata_scaled$conveyor_duty <-mydata$conveyor_duty
+ 
+#mydata<- mydata_scaled
+
+cvl_model <- function(model_data, cvfolds,which_lambda="lamba.min") {
+    set.seed(888)  
+    loops<-length(cvfolds)
+    errors <- vector("list", loops)
+    Rsqr <- vector("list", loops)
+    lmods <- vector("list", loops)
+    for (i in 1:loops) {
+        #browser()
+        test_idx <- cvfolds[[i]]
+        #original
+        train_norm<- preProcess(model_data[-test_idx, c("rate",all_pred_list)])
+        train_df <- predict(train_norm,model_data[-test_idx, c("rate",all_pred_list)])
+        test_df <- predict(train_norm,model_data[test_idx, c("rate",all_pred_list)])
+        
+        train_matrix<-model.Matrix(rate~.,train_df,sparse=TRUE,xlev=1)
+        test_matrix<- model.Matrix(rate~.,test_df,sparse=TRUE,xlev=1)
+        
+        #Find the optimum lambda using 10fold cross validation on this training dataset
+        cv.out<-cv.glmnet(x=train_matrix,
+                          y=train_df$rate,
+                          alpha=1,
+                          type.measure="mse",
+                          type.multinomial="grouped",
+                          intercept=TRUE,
+                          standardize=FALSE,
+                          standardize.response=FALSE)
+        
+        #Get predictions from the model with lowest MSE
+        lasso_prob<-predict(object=cv.out,
+                                      newx=test_matrix,
+                                      s=which_lambda)
+        
+        #Extract model coefficients for model with lowest MSE
+        lmods[[i]]<-coef(object=cv.out,
+                                      newx=test_matrix,
+                                      s=which_lambda)
+        #Get Rsqr from final model
+        Rsqr[[i]]<-postResample(obs=test_df$rate,pred=lasso_prob)[[2]]
+        
+        #Get list of errors 
+        errors[[i]] <- test_df$rate - lasso_prob
+    }
+  #browser()
+  #rtn_this<-errors
+  rtn_this<-list(errors,lmods,Rsqr)
+  return(rtn_this)
+}
+
+min_getmods<- cvl_model(mydata,cvfolds,"lambda.min")
+
+get_errors_min<-min_getmods[[1]]
+
+min_cv_l_rmse <- calc_tot_cverror(get_errors_min)
+min_cv_l_rmse_var<-var(sapply(X=1:length(get_errors),function(X) {sqrt(mean(get_errors_min[[X]]^2))}))
+
+min_lmods<-getmods[[2]]
+
+min_cv_l_aveRsqr<-mean(unlist(min_getmods[[3]]))
+min_cv_l_varRsqr<-var(unlist(min_getmods[[3]]))
+
+myresults<-data.frame(parameter="lambda.min", 
+                      RMSE= min_cv_l_rmse,
+                      Rsqr=min_cv_l_aveRsqr,
+                      MAE = -999,
+                      RMSESD=sqrt(min_cv_l_rmse_var),
+                      RsqrSD=sqrt(min_cv_l_varRsqr),
+                      MAESD=-999)
+```
+
+
+### Lasso, opt lambda
+
+```{r}
+
+opt_getmods<- cvl_model(mydata,cvfolds,"lambda.1se")
+
+get_errors_opt<-opt_getmods[[1]]
+
+opt_cv_l_rmse <- calc_tot_cverror(get_errors_opt)
+opt_cv_l_rmse_var<-var(sapply(X=1:length(get_errors),function(X) {sqrt(mean(get_errors_opt[[X]]^2))}))
+
+opt_lmods<-getmods[[2]]
+
+opt_cv_l_aveRsqr<-mean(unlist(opt_getmods[[3]]))
+opt_cv_l_varRsqr<-var(unlist(opt_getmods[[3]]))
+
+myresults<-rbind(myresults,
+                 data.frame(parameter="lambda.opt", 
+                      RMSE= opt_cv_l_rmse,
+                      Rsqr=opt_cv_l_aveRsqr,
+                      MAE = -999,
+                      RMSESD=sqrt(opt_cv_l_rmse_var),
+                      RsqrSD=sqrt(opt_cv_l_varRsqr),
+                      MAESD=-999))
+myresults
+
+```
+
+#### Lasso, final model
+
+```{r}
+
+#retrain on whole model and use cv to get the best lambda values
+final_lassmod_MT<-cv.glmnet(x=x,
+                            y=mydata$rate,
+                            alpha=1,
+                            type.measure="mse",
+                            type.multinomial="grouped",
+                            intercept=TRUE,
+                            standardize=!normalize,
+                            standardize.response=FALSE)
+
+min_lambda_MT<-final_lassmod_MT$lambda.min
+opt_lambda_MT<-final_lassmod_MT$lambda.1se
+
+predictions_min<-as.vector(predict(final_lassmod_MT,x,s=min_lambda_MT)[,1])
+predictions_opt<- as.vector(predict(final_lassmod_MT,x,s=opt_lambda_MT)[,1])
+
+lasso_m.results<-cbind(
+                    min=unlist(postResample(predictions_min,as.vector(mydata$rate))),
+                    opt=unlist(postResample(predictions_opt,as.vector(mydata$rate)))
+                    )
+lasso_m.results
+
+
+#Add results to results
+cvmod<-final_lassmod_MT
+results<-rbind(results, 
+               data.frame(metric="mm/MT",
+                        wear_type="mean",
+                        model_name="Lasso Model Selection - lambda.min",
+                        model_par_list="All variables",
+                        folds=k,
+                        repeats=n_reps,
+                        PRMSE=myresults[[2]][1],
+                        PRMSE.SD=myresults[[5]][1],
+                        P.Rsqr=myresults[[3]][1],
+                        P.Rsqr.SD=myresults[[6]][1],
+                        sigma=-1,
+                        df=12,
+                        R2=lasso_m.results["Rsquared","min"],
+                        AdjR2=0,
+                        stringsAsFactors = FALSE),
+               data.frame(metric="mm/MT",
+                        wear_type="mean",
+                        model_name="Lasso Model Selection - lambda.opt",
+                        model_par_list="All variables",
+                        folds=k,
+                        repeats=n_reps,
+                        PRMSE=myresults[[2]][2],
+                        PRMSE.SD=myresults[[5]][2],
+                        P.Rsqr=myresults[[3]][2],
+                        P.Rsqr.SD=myresults[[6]][2],
+                        sigma=-1,
+                        df=12,
+                        R2=lasso_m.results["Rsquared","min"],
+                        AdjR2=0,
+                        stringsAsFactors = FALSE))
+
+
+
+#Print final model
+cat("Minimum Lambda model","\n")
+coef(final_lassmod_MT,s=min_lambda_MT)
+
+#Print final model
+cat("\n","Optimal Lambda model","\n")
+coef(final_lassmod_MT,s=opt_lambda_MT)
+
+```
+
+#### Variable importance on Lasso - minlambda
+
+```{r}
+mydata<-wear_util_mean[,c("rate",all_pred_list)]
+
+train_matrix<-sparse.model.matrix(rate~.,data=mydata)
+train.formula <- as.formula(all_pred)
+
+#Rerun the model using the train function to get the train Object that works with the vi function
+lasso.model.caret_MT_min<-train(x=train_matrix,
+                         y=as.vector(model.frame(train.formula,mydata)[[1]]),
+                         #y=as.vector(mydata$rate),
+                         method="glmnet",
+                         metric="RMSE",
+                         tuneGrid=data.frame(.alpha=1,
+                                             .lambda=min_lambda_MT),
+                         type.multinomial="grouped",
+                         intercept=TRUE,
+                         standardize=!normalize,
+                         standardize.response=FALSE,
+                         trControl=trainControl()
+                         )
+#add the training data to the model because their is a bug here and it doesn't
+lasso.model.caret_MT_min$trainingData<-train_matrix
+
+
+#Plot variable importance
+vidata_lassm_MT_min<-vi(lasso.model.caret_MT_min,
+         method="firm", ice=TRUE,
+         feature_names = lasso.model.caret_MT_min$finalModel$xNames,
+         train=train_matrix,
+         type="regression",scale=TRUE)
+
+viplot_lassm_MT_min<-ggplot(vidata_lassm_MT_min, aes(x=reorder(Variable,Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, Lasso Model") +
+  xlab("") + 
+    coord_flip()
+viplot_lassm_MT_min
+
+coef(lasso.model.caret_MT_min$finalModel,s=min_lambda_MT)
+
+
+
+```
+
+
+####Variable importance on Lasso - opt lambda
+```{r}
+mydata<-wear_util_mean[,c("rate",all_pred_list)]
+
+train_matrix<-sparse.model.matrix(rate~.,data=mydata)
+train.formula <- as.formula(all_pred)
+
+#Rerun the model using the train function to get the train Object that works with the vi function
+lasso.model.caret_MT_opt<-train(x=train_matrix,
+                         y=as.vector(model.frame(train.formula,mydata)[[1]]),
+                         #y=as.vector(mydata$rate),
+                         method="glmnet",
+                         metric="RMSE",
+                         tuneGrid=data.frame(.alpha=1,
+                                             .lambda=opt_lambda_MT),
+                         type.multinomial="grouped",
+                         intercept=TRUE,
+                         standardize=!normalize,
+                         standardize.response=FALSE,
+                         trControl=trainControl()
+                         )
+#add the training data to the model because their is a bug here and it doesn't
+lasso.model.caret_MT_opt$trainingData<-train_matrix
+
+
+#Plot variable importance
+vidata_lassm_MT_opt<-vi(lasso.model.caret_MT_opt,
+         method="firm", ice=TRUE,
+         feature_names = lasso.model.caret_MT_opt$finalModel$xNames,
+         train=train_matrix,
+         type="regression",scale=TRUE)
+
+viplot_lassm_MT_opt<-ggplot(vidata_lassm_MT_opt, aes(x=reorder(Variable,Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, Lasso Model") +
+  xlab("") + 
+    coord_flip()
+viplot_lassm_MT_opt
+
+coef(lasso.model.caret_MT_opt$finalModel,s=opt_lambda_MT)
+```
+
+
+### Relative importance plots
+
+```{r Plot all VI for mean mm/MT}
+
+aggconv<-function(df){
+  #browser()
+  newval=list()
+  whichvals=list()
+  for(i in 1:length(df$Variable)){
+  if(substr(df$Variable[i],1,8)=='conveyor'){
+    newval=cbind(newval,df$Importance[i])
+    whichvals=cbind(whichvals,i)
+    }
+  }
+  df<-slice(df,-unlist(whichvals))
+  df<-rbind(df,data.frame(Variable="conveyor_duty",Importance=mean(unlist(newval))))
+  df<-arrange_at(df,c("Variable"))
+  return(df)
+}
+
+
+lassdata_min<-data.frame(select_all(vidata_lassm_MT_min)) 
+lassdata_min$Importance<-lassdata_min$Importance/100 
+lassdata_min<-aggconv(lassdata_min)
+lassdata_min<-rbind(data.frame(Importance=NA,Variable="(Intercept)"),lassdata_min)
+
+lassdata_opt<-data.frame(select_all(vidata_lassm_MT_opt)) 
+lassdata_opt$Importance<-lassdata_opt$Importance/100 
+lassdata_opt<-aggconv(lassdata_opt)
+lassdata_opt<-rbind(data.frame(Importance=NA,Variable="(Intercept)"),lassdata_opt)
+
+glmultidata<-data.frame(select_all(glmulti.imp)) 
+glmultidata<-aggconv(glmultidata)
+glmultidata<-rbind(data.frame(Importance=NA,Variable="(Intercept)"),glmultidata)
+
+stepwisedata<-data.frame(select_all(vidata_steplm_MT)) 
+stepwisedata<-aggconv(stepwisedata)
+stepwisedata$Importance<-stepwisedata$Importance/100
+stepwisedata<-rbind(data.frame(Importance=NA,Variable="(Intercept)"),stepwisedata)
+
+ 
+linmoddata<-data.frame(select_all(vidata_lm)[1:2])
+linmoddata<-aggconv(linmoddata)
+linmoddata$Importance<-linmoddata$Importance/max(linmoddata$Importance)
+
+linmoddata<-rbind(data.frame(Importance=NA,Variable="(Intercept)"),linmoddata)
+
+
+
+relImps<-data.frame("MLR"=linmoddata$Importance,
+                    'StepWise Selection'=stepwisedata$Importance,
+                    'Lasso best'=lassdata_min$Importance,
+                    'Lasso opt'=lassdata_opt$Importance,
+                    'Weighted Averaging'=glmultidata$Importance,
+                    variables=as.character(linmoddata$Variable))
+relImps<-relImps[-1,] #remove intercept
+rownames(relImps)<-relImps$variables
+
+
+# viridis colors: "#440154FF","#46337EFF","#365C8DFF","#277F8EFF","#1FA187FF","#4AC16DFF","#9FDA3AFF","#FDE725FF"
+impl1<-ggplot(relImps,aes(variables,MLR)) + 
+  geom_bar(stat='identity',color='#440154FF',fill='#440154FF') +
+  theme_bw()+
+  scale_fill_viridis(discrete=TRUE) + 
+  scale_color_viridis(discrete=TRUE) +
+  labs(x="", y="Full model (ICE)")+
+  coord_flip()
+
+impl2<-ggplot(relImps,aes(variables,StepWise.Selection)) + 
+  geom_bar(stat='identity',color='#365C8DFF',fill='#365C8DFF') +
+  theme_bw()+
+  scale_fill_viridis(discrete=TRUE) + 
+  scale_color_viridis(discrete=TRUE) +
+  labs(x="", y="StepWise (ICE)")+
+  theme(axis.text.y=element_blank())+
+  coord_flip()
+
+impl3<-ggplot(relImps,aes(variables,Weighted.Averaging)) + 
+  geom_bar(stat='identity',color='#1FA187FF',fill='#1FA187FF') +
+  theme_bw()+
+  scale_fill_viridis(discrete=TRUE) + 
+  scale_color_viridis(discrete=TRUE) +
+  labs(x="", y="Model Averaging (ICE)")+
+   coord_flip()
+
+impl4<-ggplot(relImps,aes(variables,Lasso.best)) + 
+  geom_bar(stat='identity',color='#9FDA3AFF',fill='#9FDA3AFF') +
+  theme_bw()+
+  scale_fill_viridis(discrete=TRUE) + 
+  scale_color_viridis(discrete=TRUE) +
+  labs(x="", y="Lasso - best model (ICE)")+
+  #theme(axis.text.y=element_blank())+
+   coord_flip()
+
+impl5<-ggplot(relImps,aes(variables,Lasso.opt)) + 
+  geom_bar(stat='identity',color='#FDE725FF',fill='#FDE725FF') +
+  theme_bw()+
+  scale_fill_viridis(discrete=TRUE) + 
+  scale_color_viridis(discrete=TRUE) +
+  labs(x="", y="Lasso - simplest model (ICE)")+
+  theme(axis.text.y=element_blank())+
+   coord_flip()
+
+thisplot<-grid.arrange(impl1,impl2,impl4,impl5,impl3,nrow=3, widths=c(10,7),heights=c(10,10,10))
+thisplot
+ggsave(plot=thisplot,filename="Figure10.png",
+       scale = 1, width = 6, height = 7, dpi = 300)
+```
+
+
+## Mean Wear vs Time (mm/wk) Models 
+
+First we have to change the dataset to show the time based data
+```{r}
+wear_util_mean <- wear_data %>%
+  filter(metric == "mm/week",
+         wear_type == "mean") %>%
+  arrange(pool)
+
+
+if(normalize){
+ wear_util_mean<-scaledata(wear_util_mean,
+                           c("pool","conveyor_duty","metric","wear_type","r2","std_error","maxdate",
+                            "original_duty","position","TotalMTFines","TotalMTLump","std_err","rate"),
+                           numeric_pred_list)
+  
+  
+}
+
+head(wear_util_mean)
+```
+
+### CV: Null hypothesis 
+
+```{r Null hypothesis mm/wk}
+
+mydata<-wear_util_mean
+tc_lm<-trainControl(method="repeatedcv",
+                    repeats=n_reps,
+                    number=k,
+                    indexOut=cvfolds,
+                    index=traindata,
+                    savePredictions = TRUE)
+
+nested_lm_mean_null_wk<-train(y=mydata$rate,
+                      x=mydata[],
+                      trControl=tc_lm,
+                      method = "null",
+                      metric="RMSE",
+                      preProcess = c("center","scale"))
+
+summ<-summary(nested_lm_mean_null_wk)
+nested_lm_mean_null_wk$results
+
+cvmod<-nested_lm_mean_null_wk
+results<-rbind(results, data.frame(metric="mm/wk",
+                                    wear_type="mean",
+                                    model_name="Null model",
+                                    model_par_list="rate ~ constant",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=-1,
+                                    P.Rsqr=-1,
+                                    P.Rsqr.SD=-1,
+                                    sigma=-1,
+                                    df=-1,
+                                    R2=0,
+                                    AdjR2=0,
+                                    stringsAsFactors = FALSE))
+
+
+
+```
+
+
+### Full Model
+
+```{r Full model mm/wk}
+
+mydata<-wear_util_mean
+
+nested_lm_mean_wk<-train(y=mydata$rate,
+                      x=mydata[,all_pred_list],
+                      trControl=tc_lm,
+                      method = "lm",
+                      metric="RMSE",
+                      preProcess = c("center","scale")
+                 )
+
+#Add results to results
+summ<-summary(nested_lm_mean_wk)
+cvmod<-nested_lm_mean_wk
+nested_lm_mean_wk$results
+results<-rbind(results, data.frame(metric="mm/wk",
+                                    wear_type="mean",
+                                    model_name="Full model",
+                                    model_par_list="All variables",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+
+
+nested_lm_mean_wk_final <- lm(as.formula(all_pred),data=mydata)
+summary(nested_lm_mean_wk_final)
+
+```
+
+#### Plot of variable importance
+
+```{r}
+
+vidata_lm_wk<-vi(nested_lm_mean_wk,method="firm",scale=TRUE, ice=TRUE)
+
+viplot_lm_wk<-ggplot(vidata_lm_wk, aes(x=reorder(Variable, Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, MLR Model") +
+  xlab("") + 
+  coord_flip()
+viplot_lm_wk
+
+
+```
+
+### Untransformed simple predictors
+
+```{r Simple predictors Model mean mm/wk}
+
+mydata<-wear_util_mean
+
+nested_lm_meanwk_orig<-train(y=mydata$rate,
+                      x=mydata[,orig_pred_list],
+                      trControl=tc_lm,
+                      method = "lm",
+                      metric="RMSE",
+                      preProcess = c("center","scale")
+                      )
+
+summ<-summary(nested_lm_meanwk_orig)
+summ
+cvmod<-nested_lm_meanwk_orig
+
+results<-rbind(results, data.frame(metric="mm/wk",
+                                    wear_type="mean",
+                                    model_name="Basic variables - cv",
+                                    model_par_list="Basic variables",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+nested_lm_meanwk_orig$results
+
+rp.all<-residualPlot(nested_lm_meanwk_orig$finalModel,variable="fitted",id=TRUE)
+
+
+```
+
+### Simple transformed predictors
+
+```{r Simple transformed Predictors Model mean mm/wk}
+
+mydata<-wear_util_mean
+
+nested_lm_meanwk_simple<-train(y=mydata$rate,
+                      x=mydata[,simple_pred_list],
+                      trControl=tc_lm,
+                      method = "lm",
+                      metric="RMSE",
+                      preProcess = c("center","scale")
+                 )
+
+summ<-summary(nested_lm_meanwk_simple)
+summ
+cvmod<-nested_lm_meanwk_simple
+
+results<-rbind(results, data.frame(metric="mm/wk",
+                                    wear_type="mean",
+                                    model_name="Basic transfomred variables - cv",
+                                    model_par_list="Basic transformed variables",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+nested_lm_meanwk_simple$results
+
+rp.all<-residualPlot(nested_lm_meanwk_simple$finalModel,variable="fitted",id=TRUE)
+
+
+```
+
+
+### Model of conveyor_duty only
+
+```{r Conveyor Duty only - mm/wk}
+
+mydata<-wear_util_mean
+x<-mydata[,c("conveyor_duty")]
+
+nested_lmcd_mean_wk<-train(rate~conveyor_duty,
+                      data=mydata,
+                      trControl=tc_lm,
+                      method = "lm",
+                      metric="RMSE",
+                      preProcess = c("center","scale"))
+
+#Add results to results
+summ<-summary(nested_lmcd_mean_wk)
+summ
+cvmod<-nested_lmcd_mean_wk
+nested_lmcd_mean_wk$results
+results<-rbind(results, data.frame(metric="mm/wk",
+                                    wear_type="mean",
+                                    model_name="rate ~ conveyor_duty",
+                                    model_par_list="conveyor_duty",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+
+plot(varImp(nested_lmcd_mean_wk))
+
+```
+
+### Model of v1 only
+
+```{r V1 Only model - mm/wk}
+
+mydata<-wear_util_mean
+
+
+nested_lmv1_mean_wk<-train(rate~v1,
+                            data=mydata,
+                            trControl=tc_lm,
+                            method = "lm",
+                            metric="RMSE",
+                            preProcess = c("center","scale"))
+
+#Add results to results
+summ<-summary(nested_lmv1_mean_wk)
+summ
+cvmod<-nested_lmv1_mean_wk
+nested_lmv1_mean_wk$results
+results<-rbind(results, data.frame(metric="mm/wk",
+                                    wear_type="mean",
+                                    model_name="rate ~ v1",
+                                    model_par_list="v1",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+
+nested_lmv1_mean_wk$results
+
+```
+
+### Model duty+v1 only
+
+```{r Duty & v1 model - mm/wk}
+
+mydata<-wear_util_mean
+
+nested_lmv1cd_mean_wk<-train(y=mydata$rate,
+                      x=mydata[,c("conveyor_duty","v1")],
+                      trControl=tc_lm,
+                      method = "lm",
+                      metric="RMSE",
+                      preProcess = c("center","scale"))
+
+
+summ<-summary(nested_lmv1cd_mean_wk)
+summ
+cvmod<-nested_lmv1cd_mean_wk
+nested_lmv1cd_mean_wk$results
+results<-rbind(results, data.frame(metric="mm/wk",
+                                    wear_type="mean",
+                                    model_name="rate ~ v1 + conveyor_duty",
+                                    model_par_list="v1, conveyor_duty",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+
+```
+
+
+### StepWise Model Selection
+
+```{r Stepwise Selection - mm/wk}
+
+x<-mydata[,all_pred_list]
+
+nested_steplm_mean_wk<-train(y=mydata$rate,
+                      x=x,
+                      trControl=tc_lm,
+                      method = "lmStepAIC",
+                      k=2,
+                      trace=FALSE,
+                      metric="RMSE",
+                      preProcess = c("center","scale"))
+
+summ<-summary(nested_steplm_mean_wk)
+summ
+cvmod<-nested_steplm_mean_wk
+nested_steplm_mean_wk$results
+results<-rbind(results, data.frame(metric="mm/wk",
+                                    wear_type="mean",
+                                    model_name="StepWise model selection",
+                                    model_par_list="All variables",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=cvmod$results[[2]],
+                                    PRMSE.SD=cvmod$results[[5]],
+                                    P.Rsqr=cvmod$results[[3]],
+                                    P.Rsqr.SD=cvmod$results[[6]],
+                                    sigma=summ$sigma,
+                                    df=summ$df[1],
+                                    R2=summ$r.squared,
+                                    AdjR2=summ$adj.r.squared,
+                                    stringsAsFactors = FALSE))
+plot(varImp(nested_steplm_mean_wk, scale=TRUE))
+
+```
+
+#### Plot of variable importance
+
+```{r variable importance - mm/wk}
+
+#nested_lm_mean$resample
+vidata_steplm_wk<-vi(nested_steplm_mean_wk,method="firm",scale=TRUE, ice=TRUE)
+
+viplot_steplm_wk<-ggplot(vidata_steplm_wk, aes(x=reorder(Variable,Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, Stepwise Model") +
+  xlab("") + 
+  coord_flip()
+
+viplot_steplm_wk
+
+
+```
+
+### Weighted Averaging Model
+
+
+```{r Weighted Averaging - mm/wk}
+
+# To use caret with models not on their list, we need to construct a modelInfo list 
+modelinfo_glmulti <- list(
+  parameters = data.frame(
+    parameter = "method", # even though we're not doing parameter tuning, 
+    class = "character",  # caret expects columns in the parameters grid
+    label = "method"
+  ),
+  grid = NULL, # but  we don't need to populate it!
+  prob = NULL,
+  type = "Regression",
+  library = "glmulti",
+  fit = function(x, y, wts, param, lev, last, weights, classProbs, ...) {
+    train_df <- data.frame(y = y, x)
+    glmulti::glmulti(
+      y = "y", 
+      xr = colnames(x),
+      data = train_df,
+      method = "h",
+      crit="aic",
+      level = 1,
+      plotty = FALSE, # quiet output please
+      report = FALSE
+    )
+  },
+  predict = function(modelFit, newdata, preProc = NULL, submodels = NULL) {
+    # must return a *vector* of predictions
+    as.vector(glmulti::predict.glmulti(modelFit, newdata = newdata)$averages)
+  }
+)
+
+# create trainControl object
+tc_glmulti <- trainControl(
+  method = "repeatedcv",
+  number = k,
+  repeats = n_reps,
+  returnResamp = "all", 
+  savePredictions = "all",
+  index = traindata # don't need to specify indexOut
+)
+
+mdl_glm <- train(
+  y = mydata$rate,
+  x = mydata[, all_pred_list],
+  metric = "RMSE",
+  method = modelinfo_glmulti,
+  trControl = tc_glmulti,
+  tuneGrid = data.frame(method = "h", stringsAsFactors = FALSE),
+  preProc = c("center", "scale") # mydata appears to already be centred and scaled, 
+                                 # which should be deferred until here
+)
+
+mdl_glm
+```
+
+#### Final Model
+
+```{r WA Final model - mm/wk}
+
+mydata<-wear_util_mean
+
+x<-model.matrix(as.formula(all_pred),mydata[,c("rate",all_pred_list)],xlev=1)
+y<-mydata$rate
+
+getmods<- cvg_mod(mydata,cvfolds,50)
+get_errors<-getmods[[1]]
+
+cv_g_rmse <- calc_tot_cverror(get_errors)
+cv_g_rmse_var <- calc_cv_error_var(get_errors) 
+
+cv_g_aveRsqr<-mean(unlist(getmods[[3]]))
+cv_g_varRsqr<-var(unlist(getmods[[3]]))
+
+myresults<-data.frame(parameter="none", 
+                      RMSE= cv_g_rmse,
+                      Rsqr=cv_g_aveRsqr,
+                      MAE = -999,
+                      RMSESD=sqrt(cv_g_rmse_var),
+                      RsqrSD=sqrt(cv_g_varRsqr),
+                      MAESD=-999)
+
+
+myresults
+
+# Rerun model on all data
+finalglModel_wk<-glmulti(y="rate",
+                       xr=all_pred_list,
+                       data=mydata,
+                       crit="aic",
+                       level=1,
+                       fitfunction = "lm",
+                       plotty=FALSE,
+                       report=FALSE,
+                       includeobjects = TRUE,
+                       confsetsize = 200)
+
+predictions<-predict.glmulti(finalglModel_wk,select=10.0)
+gldata<-postResample(pred=predictions$averages,obs=mydata$rate)  
+gldata
+coef(finalglModel_wk,select=10.0)
+
+goodmodels_wk<-weightable(finalglModel_wk)
+goodmodels_wk$delta<-goodmodels_wk$aic-min(goodmodels_wk$aic)
+bestmodels_wk<-goodmodels_wk[goodmodels_wk$delta<=10.0,]
+
+results<-rbind(results, data.frame(metric="mm/wk",
+                                    wear_type="mean",
+                                    model_name="Model Averaging",
+                                    model_par_list="All variables",
+                                    folds=k,
+                                    repeats=n_reps,
+                                    PRMSE=myresults[[2]],
+                                    PRMSE.SD=myresults[[5]],
+                                    P.Rsqr=myresults[[3]],
+                                    P.Rsqr.SD=myresults[[6]],
+                                    sigma=-1,
+                                    df=12,
+                                    R2=gldata[[2]],
+                                    AdjR2=1-(1-gldata[[2]])* (164/143),
+                                    stringsAsFactors = FALSE))
+
+
+```
+
+
+#### Show best models with AIC<=2 and AIC <=10
+
+```{r Show best WA models - mm/wk}
+
+bestmodels_wk_10<-goodmodels_wk[goodmodels_wk$delta<=10.0,]
+bestmodels_wk_10
+
+bestmodels_wk_2<-goodmodels_wk[goodmodels_wk$delta<=2.0,]
+bestmodels_wk_2
+```
+
+
+#### Plot of variable importance
+
+```{r Variable Importance - mm/wk}
+
+#w<-bestmodels_wk_10
+all_terms<- all_pred_list
+
+pred.gl.matrix_wk_10<-data.frame(matrix(ncol=length(all_terms),nrow=0))
+colnames(pred.gl.matrix_wk_10)<- all_terms
+pred.gl.matrix_wk_2<-data.frame(matrix(ncol=length(all_terms),nrow=0))
+colnames(pred.gl.matrix_wk_2)<- all_terms
+
+for(i in 1:length(bestmodels_wk_10$model)){
+  pred.gl.matrix_wk_10<-rbind(pred.gl.matrix_wk_10, 
+              getTermsArray(all_terms,
+                            as.formula(as.character(bestmodels_wk_10$model[[i]])),bestmodels_wk_10$weights[[i]]))
+  
+}
+for(i in 1:length(bestmodels_wk_2$model)){
+  pred.gl.matrix_wk_2<-rbind(pred.gl.matrix_wk_2, 
+              getTermsArray(all_terms,
+                            as.formula(as.character(bestmodels_wk_2$model[[i]])),bestmodels_wk_2$weights[[i]]))
+  
+}
+
+glmulti.imp_wk_10<-data.frame(Variable=as.character(all_terms),Importance=as.vector(colSums(pred.gl.matrix_wk_10)))
+glmulti.imp_wk_2<-data.frame(Variable=as.character(all_terms),Importance=as.vector(colSums(pred.gl.matrix_wk_2)))
+
+viplot_glmulti_wk_10<-ggplot(glmulti.imp_wk_10, aes(x=reorder(Variable, Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, Weighted-Avg Model, dAIC<10") +
+  xlab("") + 
+  coord_flip()
+viplot_glmulti_wk_10
+
+viplot_glmulti_wk_2<-ggplot(glmulti.imp_wk_2, aes(x=reorder(Variable, Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, Weighted-Avg Model, dAIC<2") +
+  xlab("") + 
+  coord_flip()
+viplot_glmulti_wk_2
+
+```
+
+
+### Lasso, min lambda
+
+
+```{r - Lasso, min lambda - mm/wk}
+
+mydata<-wear_util_mean[,c("rate",all_pred_list)]
+
+x<-model.Matrix(as.formula(all_pred),mydata,xlev=1,sparse=TRUE)
+y<-as.vector(mydata$rate)
+
+min_getmods<- cvl_model(mydata,cvfolds,"lambda.min")
+
+get_errors_min<-min_getmods[[1]]
+
+min_cv_l_rmse <- calc_tot_cverror(get_errors_min)
+min_cv_l_rmse_var<-var(sapply(X=1:length(get_errors),function(X) {sqrt(mean(get_errors_min[[X]]^2))}))
+
+min_lmods<-getmods[[2]]
+
+min_cv_l_aveRsqr<-mean(unlist(min_getmods[[3]]))
+min_cv_l_varRsqr<-var(unlist(min_getmods[[3]]))
+
+myresults<-data.frame(parameter="lambda.min", 
+                      RMSE= min_cv_l_rmse,
+                      Rsqr=min_cv_l_aveRsqr,
+                      MAE = -999,
+                      RMSESD=sqrt(min_cv_l_rmse_var),
+                      RsqrSD=sqrt(min_cv_l_varRsqr),
+                      MAESD=-999)
+```
+
+Caret implementation of grouped lasso using gglaso.
+
+```{r - Grouped Lasso - mm/wk}
+
+# To use caret with models not on their list, we need to construct a modelInfo list 
+modelinfo_gglasso <- list(
+  parameters = data.frame(
+    parameter = "nlambda", # even though we're not doing parameter tuning, 
+    class = "integer",  # caret expects columns in the parameters grid
+    label = "nlambda"
+  ),
+  grid = NULL, # but  we don't need to populate it!
+  prob = NULL,
+  type = "Regression",
+  library = "gglasso",
+  fit = function(x, y, wts, param, lev, last, weights, classProbs, ...) {
+    # this assumes a treatment contrasts encoding for conveyor duty,
+    # maybe not what we want (one duty level will be excluded)
+    # possibly would be better to have every level included, and drop the intercept
+    # in the model fitting part (gglasso adds an intercept term unless you tell it not to)
+    x <- model.matrix(~.-1, data = x) # no intercept in x matrix, it will be added later
+
+    # set group indices based on columns of model matrix (all conveyor_duty vars 
+    # are to be grouped, everything else is its own group)
+    duty_cols <- which(str_detect(colnames(x), "conveyor_duty"))
+    dgroup <- rep(1, ncol(x))
+    dgroup[tail(duty_cols, -1)] <- 0
+    dgroup <- cumsum(dgroup)
+    
+    cv.gglasso(x, y, loss = "ls", group = dgroup)
+  },
+  predict = function(modelFit, newdata, preProc = NULL, submodels = NULL) {
+    # must return a *vector* of predictions
+    newx = model.matrix(~.-1, data = newdata)
+    # We will use the optimal value of lambda to make predictions (lambda.min), 
+    # not the largest value of lambda such that error is within 1 se of minimum (lambda.lse).
+    # Note that we do not need to refit the model if we want to use lambda.lse, just
+    # specify its value here.
+    predict.gglasso(modelFit$gglasso.fit, newx = newx, s = c(modelFit$lambda.min,modelFit$lambda.1se)) %>% 
+      as.vector
+  }
+)
+
+# create trainControl object
+tc_gglasso <- trainControl(
+  method = "repeatedcv",
+  number = k,
+  repeats = n_reps,
+  returnResamp = "all", 
+  savePredictions = "all",
+  index = traindata # don't need to specify indexOut
+)
+
+mdl_gglasso_min_wk <- train(
+  y = mydata$rate,
+  x = mydata[, all_pred_list],
+  metric = "RMSE",
+  method = modelinfo_gglasso,
+  trControl = tc_gglasso,
+  s="lambda.min",
+  tuneGrid = data.frame(nlambda = 100, stringsAsFactors = FALSE), # this is not used
+  preProc = c("center", "scale") # mydata appears to already be centred and scaled, 
+                                 # which should be deferred until here
+)
+
+
+mdl_gglasso_min_wk
+mdl_gglasso_opt_wk
+```
+
+
+### Lasso, opt lambda
+```{r - Lasso, opt lambda - mm/wk}
+
+opt_getmods<- cvl_model(mydata,cvfolds,"lambda.1se")
+
+get_errors_opt<-opt_getmods[[1]]
+
+opt_cv_l_rmse <- calc_tot_cverror(get_errors_opt)
+opt_cv_l_rmse_var<-var(sapply(X=1:length(get_errors),function(X) {sqrt(mean(get_errors_opt[[X]]^2))}))
+
+opt_lmods<-getmods[[2]]
+
+opt_cv_l_aveRsqr<-mean(unlist(opt_getmods[[3]]))
+opt_cv_l_varRsqr<-var(unlist(opt_getmods[[3]]))
+
+myresults<-rbind(myresults,
+                 data.frame(parameter="lambda.opt", 
+                      RMSE= opt_cv_l_rmse,
+                      Rsqr=opt_cv_l_aveRsqr,
+                      MAE = -999,
+                      RMSESD=sqrt(opt_cv_l_rmse_var),
+                      RsqrSD=sqrt(opt_cv_l_varRsqr),
+                      MAESD=-999))
+myresults
+
+```
+
+```{r}
+
+#retrain on whole model and use cv to get the best lambda values
+final_lassmod_wk<-cv.glmnet(x=x,
+                            y=mydata$rate,
+                            alpha=1,
+                            type.measure="mse",
+                            type.multinomial="grouped",
+                            intercept=TRUE,
+                            standardize=!normalize,
+                            standardize.response=FALSE)
+
+min_lambda_wk<-final_lassmod_wk$lambda.min
+opt_lambda_wk<-final_lassmod_wk$lambda.1se
+
+predictions_min<-as.vector(predict.cv.glmnet(final_lassmod_wk,x,s=min_lambda_wk)[,1])
+predictions_opt<- as.vector(predict.cv.glmnet(final_lassmod_wk,x,s=opt_lambda_wk)[,1])
+
+lasso_m.results<-cbind(
+                    min=unlist(postResample(predictions_min,as.vector(mydata$rate))),
+                    opt=unlist(postResample(predictions_opt,as.vector(mydata$rate)))
+                    )
+lasso_m.results
+
+
+#Add results to results
+cvmod<-final_lassmod_wk
+results<-rbind(results, 
+               data.frame(metric="mm/wk",
+                        wear_type="mean",
+                        model_name="Lasso Model Selection - lambda.min",
+                        model_par_list="All variables",
+                        folds=k,
+                        repeats=n_reps,
+                        PRMSE=myresults[[2]][1],
+                        PRMSE.SD=myresults[[5]][1],
+                        P.Rsqr=myresults[[3]][1],
+                        P.Rsqr.SD=myresults[[6]][1],
+                        sigma=-1,
+                        df=12,
+                        R2=lasso_m.results["Rsquared","min"],
+                        AdjR2=0,
+                        stringsAsFactors = FALSE),
+               data.frame(metric="mm/wk",
+                        wear_type="mean",
+                        model_name="Lasso Model Selection - lambda.opt",
+                        model_par_list="All variables",
+                        folds=k,
+                        repeats=n_reps,
+                        PRMSE=myresults[[2]][2],
+                        PRMSE.SD=myresults[[5]][2],
+                        P.Rsqr=myresults[[3]][2],
+                        P.Rsqr.SD=myresults[[6]][2],
+                        sigma=-1,
+                        df=12,
+                        R2=lasso_m.results["Rsquared","opt"],
+                        AdjR2=0,
+                        stringsAsFactors = FALSE))
+
+
+
+#Print final model
+cat("Minimum Lambda model","\n")
+coef.cv.glmnet(final_lassmod_wk,s=min_lambda_wk)
+
+#Print final model
+cat("\n","Optimal Lambda model","\n")
+coef.cv.glmnet(final_lassmod_wk,s=opt_lambda_wk)
+
+lasso_m.results
+```
+
+####Variable importance on Lasso - minlambda
+
+```{r - Lasso, min lambda - mm/wk}
+
+mydata<-wear_util_mean[,c("rate",all_pred_list)]
+
+#train_mf<-model.frame(formula=rate~.,data=mydata,xlev=1)
+train_matrix<-sparse.model.matrix(rate~.,data=mydata)
+train.formula <- as.formula(all_pred)
+
+#Rerun the model using the train function to get the train Object that works with the vi function
+lasso.model.caret_wk_min<-train(x=train_matrix,
+                         y=as.vector(model.frame(train.formula,mydata)[[1]]),
+                         method="glmnet",
+                         metric="RMSE",
+                         tuneGrid=data.frame(.alpha=1,
+                                             .lambda=min_lambda_wk),
+                         type.multinomial="grouped",
+                         intercept=TRUE,
+                         standardize=!normalize,
+                         standardize.response=FALSE,
+                         trControl=trainControl()
+                         )
+#add the training data to the model because their is a bug here and it doesn't
+lasso.model.caret_wk_min$trainingData<-train_matrix
+
+
+#Plot variable importance
+vidata_lassm_wk_min<-vi(lasso.model.caret_wk_min,
+         method="firm", ice=TRUE,
+         feature_names = lasso.model.caret_wk_min$finalModel$xNames,
+         train=train_matrix,
+         type="regression",scale=TRUE)
+
+viplot_lassm_wk_min<-ggplot(vidata_lassm_wk_min, aes(x=reorder(Variable,Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, Lasso Model") +
+  xlab("") + 
+    coord_flip()
+viplot_lassm_wk_min
+
+coef(lasso.model.caret_wk_min$finalModel,s=min_lambda_wk)
+
+```
+
+####Variable importance on Lasso - opt lambda
+
+```{r VI on lasso, opt lambda - mm/wk}
+
+mydata<-wear_util_mean[,c("rate",all_pred_list)]
+
+#train_mf<-model.frame(formula=rate~.,data=mydata,xlev=1)
+train_matrix<-sparse.model.matrix(rate~.,data=mydata)
+train.formula <- as.formula(all_pred)
+
+#Rerun the model using the train function to get the train Object that works with the vi function
+lasso.model.caret_wk_opt<-train(x=train_matrix,
+                         y=as.vector(model.frame(train.formula,mydata)[[1]]),
+                         #y=as.vector(mydata$rate),
+                         method="glmnet",
+                         metric="RMSE",
+                         tuneGrid=data.frame(.alpha=1,
+                                             .lambda=opt_lambda_wk),
+                         type.multinomial="grouped",
+                         intercept=TRUE,
+                         standardize=!normalize,
+                         standardize.response=FALSE,
+                         trControl=trainControl()
+                         )
+#add the training data to the model because their is a bug here and it doesn't
+lasso.model.caret_wk_opt$trainingData<-train_matrix
+
+
+#Plot variable importance
+vidata_lassm_wk_opt<-vi(lasso.model.caret_wk_opt,
+         method="firm", ice=TRUE,
+         feature_names = lasso.model.caret_wk_opt$finalModel$xNames,
+         train=train_matrix,
+         type="regression",scale=TRUE)
+
+viplot_lassm_wk_opt<-ggplot(vidata_lassm_wk_opt, aes(x=reorder(Variable,Importance), weight=Importance)) + 
+  geom_bar(colour="#440154FF",fill="#440154FF") +
+  ylab("Relative Importance, Lasso Model") +
+  xlab("") + 
+    coord_flip()
+viplot_lassm_wk_opt
+
+coef(lasso.model.caret_wk_opt$finalModel,s=opt_lambda_wk)
+```
+
+
+#### Plot our relative importances
+
+```{r Create VI graphs - mm/wk}
+
+aggconv<-function(df){
+  #browser()
+  newval=list()
+  whichvals=list()
+  for(i in 1:length(df$Variable)){
+  if(substr(df$Variable[i],1,8)=='conveyor'){
+    newval=cbind(newval,df$Importance[i])
+    whichvals=cbind(whichvals,i)
+    }
+  }
+  df<-slice(df,-unlist(whichvals))
+  df<-rbind(df,data.frame(Variable="conveyor_duty",Importance=mean(unlist(newval))))
+  df<-arrange_at(df,c("Variable"))
+  return(df)
+}
+
+
+lassdata_min<-data.frame(select_all(vidata_lassm_wk_min)) 
+lassdata_min$Importance<-lassdata_min$Importance/100 
+lassdata_min<-aggconv(lassdata_min)
+lassdata_min<-rbind(data.frame(Importance=NA,Variable="(Intercept)"),lassdata_min)
+
+lassdata_opt<-data.frame(select_all(vidata_lassm_wk_opt)) 
+lassdata_opt$Importance<-lassdata_opt$Importance/100 
+lassdata_opt<-aggconv(lassdata_opt)
+lassdata_opt<-rbind(data.frame(Importance=NA,Variable="(Intercept)"),lassdata_opt)
+
+glmultidata<-data.frame(select_all(glmulti.imp_wk_10)) 
+glmultidata<-aggconv(glmultidata)
+glmultidata<-rbind(data.frame(Importance=NA,Variable="(Intercept)"),glmultidata)
+
+stepwisedata<-data.frame(select_all(vidata_steplm_wk)) 
+stepwisedata<-aggconv(stepwisedata)
+stepwisedata$Importance<-stepwisedata$Importance/100
+stepwisedata<-rbind(data.frame(Importance=NA,Variable="(Intercept)"),stepwisedata)
+
+ 
+linmoddata<-data.frame(select_all(vidata_lm)[1:2])
+linmoddata<-aggconv(linmoddata)
+linmoddata$Importance<-linmoddata$Importance/max(linmoddata$Importance)
+
+linmoddata<-rbind(data.frame(Importance=NA,Variable="(Intercept)"),linmoddata)
+
+
+
+relImps<-data.frame("MLR"=linmoddata$Importance,
+                    'StepWise Selection'=stepwisedata$Importance,
+                    'Lasso best'=lassdata_min$Importance,
+                    'Lasso opt'=lassdata_opt$Importance,
+                    'Weighted Averaging'=glmultidata$Importance,
+                    variables=as.character(linmoddata$Variable))
+relImps<-relImps[-1,] #remove intercept
+rownames(relImps)<-relImps$variables
+
+
+# viridis colors: "#440154FF","#46337EFF","#365C8DFF","#277F8EFF","#1FA187FF","#4AC16DFF","#9FDA3AFF","#FDE725FF"
+impl1<-ggplot(relImps,aes(variables,MLR)) + 
+  geom_bar(stat='identity',color='#440154FF',fill='#440154FF') +
+  theme_bw()+
+  scale_fill_viridis(discrete=TRUE) + 
+  scale_color_viridis(discrete=TRUE) +
+  labs(x="", y="Full model (ICE)")+
+  coord_flip()
+
+impl2<-ggplot(relImps,aes(variables,StepWise.Selection)) + 
+  geom_bar(stat='identity',color='#365C8DFF',fill='#365C8DFF') +
+  theme_bw()+
+  scale_fill_viridis(discrete=TRUE) + 
+  scale_color_viridis(discrete=TRUE) +
+  labs(x="", y="StepWise (ICE)")+
+  theme(axis.text.y=element_blank())+
+  coord_flip()
+
+impl3<-ggplot(relImps,aes(variables,Weighted.Averaging)) + 
+  geom_bar(stat='identity',color='#1FA187FF',fill='#1FA187FF') +
+  theme_bw()+
+  scale_fill_viridis(discrete=TRUE) + 
+  scale_color_viridis(discrete=TRUE) +
+  labs(x="", y="Model Averaging (Wtd Freq)")+
+   coord_flip()
+
+impl4<-ggplot(relImps,aes(variables,Lasso.best)) + 
+  geom_bar(stat='identity',color='#9FDA3AFF',fill='#9FDA3AFF') +
+  theme_bw()+
+  scale_fill_viridis(discrete=TRUE) + 
+  scale_color_viridis(discrete=TRUE) +
+  labs(x="", y="Lasso - best model (ICE)")+
+  #theme(axis.text.y=element_blank())+
+   coord_flip()
+
+impl5<-ggplot(relImps,aes(variables,Lasso.opt)) + 
+  geom_bar(stat='identity',color='#FDE725FF',fill='#FDE725FF') +
+  theme_bw()+
+  scale_fill_viridis(discrete=TRUE) + 
+  scale_color_viridis(discrete=TRUE) +
+  labs(x="", y="Lasso - simplest model (ICE)")+
+  theme(axis.text.y=element_blank())+
+   coord_flip()
+
+thisplot<-grid.arrange(impl1,impl2,impl4,impl5,impl3,nrow=3, widths=c(10,7),heights=c(10,10,10))
+ggsave(plot=thisplot,filename="Figure11.png",
+       scale = 1, width = 6, height = 7, dpi = 300)
+```
+
+```{r write results to file}
+
+write.csv(results,paste0("../../data/output/modelling/norm3_results_k",format(k,digits=3,trim=TRUE),"_n",format(n_reps,digits=3,trim=TRUE),"Strat1.csv"))
+
+
+```

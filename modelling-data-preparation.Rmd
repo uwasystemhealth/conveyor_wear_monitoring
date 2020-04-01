@@ -1,0 +1,694 @@
+---
+#
+# IMPORTANT 
+# This code chunk will return an error if you attempt to run it directly,
+# it is only meant to be run when knitting (through the Knit button or rmarkdown::render)
+#
+title: "Prepare Modelling Data"
+output: 
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scrool: true
+---
+
+<!-- This is a script to indent the table of contents based on header level -->
+<script>
+$(document).ready(function() {
+  $items = $('div#TOC li');
+  $items.each(function(idx) {
+    num_ul = $(this).parentsUntil('#TOC').length;
+    $(this).css({'text-indent': num_ul * 10, 'padding-left': 0});
+  });
+
+});
+</script>
+
+```{r setup, echo = FALSE, message = FALSE}
+library(ggplot2)
+library(cowplot)
+library(corrplot)
+library(Hmisc)
+library(viridis)
+library(knitr)
+library(gridExtra)
+library(stringr)
+library(reshape2)
+
+# Setting dplyr.show_progress to TRUE is useful for interactive use, but annoying when we want to knit to html, as it will
+# produce a long chunk of useless output in the html document.
+# set this to TRUE if you'd like to get feedback on how long complicated functions will take to finish during development.
+# Caching speeds up knitting
+options(dplyr.show_progress = FALSE)
+knitr::opts_chunk$set(cache=TRUE) 
+
+source("../data-prep/prepare-modelling-data.R")
+```
+
+
+## Purpose
+
+This notebook steps through the process of taking the anonymised data and creating a single learning table for the purpose of training a predictive model.
+
+The `prepare-modelling-data-jo.R` script contains additional functions that do most of the processing so that this notebook can be used to display the outputs of the process.
+
+```{r}
+# Root data directory
+data_root <- "../../data/"
+
+# Directory containing pdl data
+pdl_dir <- paste0(data_root, "output/pdl/") 
+
+# Directory to write modelling data when finished
+model_dir <- paste0(data_root, "output/modelling/")
+
+# create the output directory if it doesn't already exist
+if (!dir.exists(file.path(model_dir))) {
+  dir.create(model_dir)
+}
+```
+
+## Data preparation
+
+### Reading and cleaning
+
+```{r}
+rep_attr <- read.csv(paste0(pdl_dir, "report_attributes.csv"), stringsAsFactors = FALSE)
+thickness <- read.csv(paste0(pdl_dir, "thickness.csv"), stringsAsFactors = FALSE)
+util <- read.csv(paste0(pdl_dir, "utilisation.csv"), stringsAsFactors = FALSE)
+```
+
+Tidy data:
+
+* Convert all dates to datetimes by assuming a time of 12:00 noon (UTC).
+* Split material movement records over equipment ids, so that each row refers to a single piece of equipment.
+* Remove material movements that don't involve a conveyor in our data. 
+* Remove material movements that are below 300 tph or above 15000 tph, as they are unlikely to be valid.
+* Remove thickness tests within 400mm of belt edges to exclude skirt wear.
+* Remove thickness tests that predate any recorded movement for that equipment.
+
+```{r}
+rep_attr_tidy <- tidy_rep_attr(rep_attr)
+util_tidy <- tidy_util(util, rep_attr_tidy)
+thickness_tidy <- tidy_thickness(thickness, rep_attr_tidy, util_tidy,skirt_mm = 400)
+
+
+```
+
+### Data reduction
+
+Some conveyor duties have only a handful of observations, and are similar in design to other larger groups.
+These will be merged:
+
+* Merge Wharf and Tunnel duties into Yard
+* Merge Car Dumper into Transfer
+
+We will rename the combined groups so they are easy to identify.
+
+```{r}
+rep_attr_tidy$original_duty<-rep_attr_tidy$conveyor_duty
+rep_attr_tidy$conveyor_duty <- str_replace_all(rep_attr_tidy$conveyor_duty,
+                                               "Wharf|Tunnel|Yard", "Yard_Wharf_Tunnel")
+rep_attr_tidy$conveyor_duty <- str_replace_all(rep_attr_tidy$conveyor_duty,
+                                               "Car Dumper|Transfer", "Transfer_Cardumper")
+```
+
+### Create complex variables
+Two additional variables are created that are a combination of simple variables.
+
+```{r}
+rep_attr_tidy$load_freq <- rep_attr_tidy$belt_speed_ms/rep_attr_tidy$belt_length_m
+rep_attr_tidy$v1 <-rep_attr_tidy$belt_speed_ms*rep_attr_tidy$belt_speed_ms/(4*(rep_attr_tidy$belt_width_mm/1000)*rep_attr_tidy$belt_length_m)
+
+                                                                            
+```
+
+### Pooling
+
+Pool thickness data into belt lifetime groups, retaining enough data from rep_attr_tidy to accumulate tonnage without performing more joins.
+
+```{r}
+thickness_pooled <- thickness_tidy %>%
+  left_join(select(rep_attr_tidy, report_id, conveyor_id, eq_id, belt_install_datetime), 
+            by = "report_id") %>%
+  mutate(pool = group_indices(., conveyor_id, belt_install_datetime),
+         pool_desc = paste0(conveyor_id, "-", format(belt_install_datetime, "%Y-%m-%d"))) %>%
+  arrange(pool_desc) 
+
+head(thickness_pooled)
+```
+
+### Accumulating throughput
+
+```{r}
+pool_utilisation <- calculate_belt_utilisation(thickness_pooled, util_tidy) 
+head(pool_utilisation)
+```
+
+
+### Combining throughput with pooled thickness data
+
+Join onto pooled thickness data, this will form the base wear data that we can fit regression lines to in order to get the wear rate of each pool.
+
+```{r}
+wear_data <- thickness_pooled %>%
+  left_join(pool_utilisation, by = c("pool", "datetime" = "datetime_ending"))
+head(wear_data)
+```
+
+### Removing tests from pools that predate movements
+
+Some pools contain measurements that predate material movements by a significant amount of time, resulting in a bunch of points piled up on the left hand side of the thickness vs. utilisation charts. 
+
+This is still needed even after we removed thickness tests that predate the earliest recorded movement for that equipment.
+It's possible for the earliest movement for some equipment to predate the first thickness test in a pool, but for there to be a subsequent gap in movements that result in zero utilisation until later tests in the belt life. This is true for P700 (c_062), for example.
+
+We will not investigate the cause here, but simply trim all but one measurement dates (retaining the latest) that have 0 cumulative tonnes.
+
+```{r}
+
+first_pool_datetime <- pool_utilisation %>%
+  group_by(pool) %>%
+  filter(Mt_total_cum == 0) %>%
+  summarise(first_datetime = max(datetime_ending))
+
+wear_data <- wear_data %>%
+  left_join(first_pool_datetime, by = "pool") %>%
+  filter(datetime >= first_datetime) %>%
+  select(-first_datetime)
+
+```
+
+Finally, we filter out pools that have less than three measurement dates. 
+We defer this step until the end, because trimming tests dates could potentially leave too little data for the pool to be useful, where it otherwise would've had more than three measurements.
+
+```{r}
+pool_remove <- wear_data %>%
+  group_by(pool) %>%
+  summarise(n_dates = n_distinct(datetime)) %>%
+  filter(n_dates < 3) %>%
+  pull(pool)
+
+wear_data <- wear_data %>% 
+  filter(!pool %in% pool_remove) 
+```
+
+## Calculating wear rate
+
+We will create two tables of wear rate:
+
+  * mean wear rate
+  * worst-case wear rate
+  
+Mean wear rate in this instance refers to the average of all the slopes of the regression lines that have been fit to the belt thickness over time and throughput.
+
+```{r}
+# We get a couple of warnings about perfect fits, these should be safe to ignore.
+wear_rates_mean <- calculate_wear_rates_mean(wear_data)
+head(wear_rates_mean)
+```
+
+
+## Writing to file
+
+Finally, we can join the wear rates with the report attributes and save a learning table.
+
+Here we also have logic for ensuring that belt strength is homogeneous within each pool.
+Currently, by there appear to only be two pools where this is not already the case.
+
+We will take the most commonly occurring strength, and in the event of a tie, take the minimum.
+
+
+```{r}
+# helper function for getting model value(s)
+modes <- function(x) {
+  ux <- unique(x)
+  tab <- tabulate(match(x, ux))
+  ux[tab == max(tab)]
+}
+
+pool_attrs <- thickness_pooled %>%
+  group_by(pool) %>%
+  select(pool, report_id) %>%
+  distinct() %>%
+  left_join(select(rep_attr_tidy, report_id, belt_width_mm, 
+                   belt_strength_kNpm, conveyor_duty, belt_speed_ms, 
+                   belt_length_m, load_freq,v1, conveyor_id,drop_height_m,original_duty),
+            by = "report_id") %>%
+  group_by(pool) %>%
+  # next line is belt strength pool logic
+  mutate(belt_strength_kNpm = ifelse(all(is.na(belt_strength_kNpm)), 
+                                     NA,
+                                     min(modes(belt_strength_kNpm), na.rm = TRUE))) %>%
+  ungroup() %>%
+  select(-report_id) %>%
+  distinct()
+
+# No pool should have more than one row in this table, because we formed pools such that all
+# explanatory variables are homogeneous
+valid_results <- pool_attrs %>%
+  group_by(pool) %>%
+  summarise(n = n()) %>%
+  pull(n) %>%
+  all(. == 1)
+
+if (!valid_results) {
+  stop("non-homogeneous pools exist!")
+}
+
+learn_table_mean <- wear_rates_mean %>%
+  left_join(pool_attrs, by = "pool") %>%
+  tibble::add_column(wear_type = "mean", .before = "metric") %>%
+  drop_na()
+
+learn_table_max <- wear_rates_max %>%
+  left_join(pool_attrs, by = "pool") %>%
+  tibble::add_column(wear_type = "max", .before = "metric") %>%
+  drop_na()
+
+learn_table <- bind_rows(learn_table_mean, learn_table_max)
+```
+
+Data is saved for subsequent modelling.
+
+
+```{r}
+# Recommend reading .rds file if using R to potential avoid ambiguities or type conversion mishaps in csv
+saveRDS(learn_table, paste0(model_dir, "/model-data.rds"))
+write.csv(learn_table, paste0(model_dir, "/model-data.csv"), row.names = FALSE)
+```
+
+## Results
+
+To summarise, we have the following records in the modelling set:
+
+```{r}
+learn_table %>%
+  group_by(wear_type, metric) %>%
+  summarise(n_records = n())
+
+```
+
+
+this is the breakdown of conveyors according to duties:
+
+```{r}
+
+#We need to work out what the spread of conveyors looks like
+#first how many conveyors belong to each duty
+select(learn_table_max,c("conveyor_duty","conveyor_id","metric")) %>%
+    filter(metric=="mm/MT")  %>%
+    group_by(conveyor_duty,conveyor_id) %>%
+    summarise(num_belts=n()) %>%
+    group_by(conveyor_duty) %>%
+    summarise(num_conveyors=n(),
+              total_belts=sum(num_belts))
+
+```
+
+This is the distribution of belts that have splices (more than one report in the final dataset)
+
+
+```{r}
+
+pools_used <- select(learn_table_max,c("conveyor_duty","conveyor_id","metric","pool")) %>%
+    filter(metric=="mm/MT")  %>%
+    group_by(conveyor_duty,conveyor_id)
+
+temptable2<- thickness_pooled %>% 
+  select("report_id","conveyor_id","pool","belt_install_datetime") %>%
+  group_by(report_id,conveyor_id,pool,belt_install_datetime) %>%
+  summarise() %>%
+  ungroup()
+
+reports_used <- inner_join(temptable2,pools_used,by="pool")
+
+select(reports_used,c("pool","conveyor_duty")) %>%
+  group_by(conveyor_duty,pool) %>%
+  summarise(n=n()) %>%
+  filter(n>1) %>%
+  group_by(conveyor_duty) %>%
+  summarise(pooledBelts=n())
+
+
+```
+
+We also need to add some transformed variables to the dataset so we can look at their correlations. 
+```{r}
+learn_table_mean$beltsp_sqr<-learn_table_mean$belt_speed_ms*learn_table_mean$belt_speed_ms
+learn_table_mean$len_inv<-1/learn_table_mean$belt_length_m
+learn_table_mean$width_inv<-1/learn_table_mean$belt_width_mm
+
+```
+Let's look at the correlation between the numerical explanatory variables in the modelling dataset
+We are only looking at the explanatory variables so can use any of the learning tables
+
+```{r}
+expvars<-select(learn_table_mean,c("metric","drop_height_m","perc_fines","v1","load_freq","beltsp_sqr","belt_speed_ms","belt_strength_kNpm","len_inv","belt_length_m","width_inv","belt_width_mm","conveyor_duty","original_duty"))
+
+expNvars<-select(expvars,-c("conveyor_duty","original_duty")) %>%
+    filter(metric=="mm/MT") %>%
+    select(-"metric") %>%
+    group_by_all() %>%
+    summarise() %>%
+    ungroup()
+
+
+```
+
+Now let's plot the correlations and save the graph:
+
+```{r}
+thisrcorr<-round(cor(x=as.matrix(expNvars)),2)
+
+thisrcorr
+
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+
+melted_corr<- melt(get_lower_tri(thisrcorr),na.rm=TRUE)
+
+melted_corr
+
+
+
+ggplot(melted_corr,aes(x=Var1,y=Var2,fill=abs(round(value,1))),type="lower") + 
+  geom_tile(color="white") +
+  geom_text(aes(Var1, Var2, label = round(value,1)), color = "black", size = 3)+
+  scale_color_viridis(discrete=TRUE) +
+  scale_fill_viridis(begin=1,
+                     end=0, 
+                     name= "Absolute Value of \n Pearson Co-efficient",
+                     guide = guide_colourbar(title.position = "top",barwidth=7),
+                     alpha = 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle=45,vjust=1,size=10,hjust=1),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.border =  element_blank(),
+        #axis.ticks = element_blank(),
+        legend.justification = c(1,0),
+        legend.position= c(0.5,0.6),
+        legend.direction = "horizontal",
+        legend.title.align = 0.5
+        ) +
+        scale_y_discrete(position="right")+
+  coord_fixed()
+
+ggsave("../../graphs/Figure6.png",width=5,height=5)
+```
+
+#Now let's summarise the wear fits we have used
+
+```{r}
+expvars<-select(learn_table_mean,c("metric","belt_width_mm","belt_length_m","belt_strength_kNpm","belt_speed_ms","load_freq","v1","perc_fines","drop_height_m","conveyor_duty")) %>%
+    filter(metric=="mm/MT") %>%
+    select(-"metric") %>%
+    group_by_all() %>%
+    summarise() %>%
+    ungroup()
+expvars
+
+```
+The following plots are created to show the changes of each variable in the dataset.
+##v1
+```{r}
+p1<-ggplot(data=expvars,aes(x=conveyor_duty,y=v1))+
+    labs(x="Conveyor Duty", y="v1=v^2/4wL")+
+    geom_violin(aes(colour=conveyor_duty))+
+    geom_jitter(aes(colour=conveyor_duty),position=position_jitter(0.1))+
+    coord_flip()+
+    scale_color_manual(values=c("#FDE725FF", "#5DC863FF", "#21908CFF" ,"#3B528BFF", "#440154FF")) +
+    theme_light()+
+    theme(legend.title=element_blank(),legend.position="bottom",legend.spacing.x =unit(0.2, "cm"))+
+    theme(axis.text.y=element_blank())
+p1
+#ggsave("graphs/duty_vs_v1.png",width=8,height=5)
+```
+##load_freq
+```{r}
+p2<-ggplot(data=expvars,aes(x=conveyor_duty,y=load_freq))+
+    labs(x="Conveyor Duty", y="Loading Frequency in Hz")+
+    geom_violin(aes(colour=conveyor_duty))+
+    geom_jitter(aes(colour=conveyor_duty),position=position_jitter(0.1))+
+    coord_flip()+
+    scale_color_manual(values=c("#FDE725FF", "#5DC863FF", "#21908CFF" ,"#3B528BFF", "#440154FF")) +
+    theme_light()+
+    theme(legend.position='none')+
+    theme(axis.text.y=element_blank())
+p2
+#ggsave("graphs/duty_vs_loadfreq.png",width=8,height=5)
+```
+#belt width
+```{r}
+#belt_width_mm
+p3<-ggplot(data=expvars,aes(x=conveyor_duty,y=belt_width_mm))+
+    labs(x="Conveyor Duty", y="Nominal Belt Width in mm")+
+    geom_violin(aes(colour=conveyor_duty))+
+    geom_jitter(aes(colour=conveyor_duty),position=position_jitter(0.1))+
+    coord_flip()+
+    scale_color_manual(values=c("#FDE725FF", "#5DC863FF", "#21908CFF" ,"#3B528BFF", "#440154FF")) +
+    theme_light()+
+    theme(legend.position='none')+
+    theme(axis.text.y=element_blank())
+p3
+#ggsave("duty_vs_width.png",width=8,height=5)
+```
+##belt length
+```{r}
+#belt_length_m
+p4<-ggplot(data=expvars,aes(x=conveyor_duty,y=belt_length_m))+
+    labs(x="Conveyor Duty", y="Belt Length in m")+
+    geom_violin(aes(colour=conveyor_duty))+
+    geom_jitter(aes(colour=conveyor_duty),position=position_jitter(0.1))+
+    coord_flip()+
+    scale_color_manual(values=c("#FDE725FF", "#5DC863FF", "#21908CFF" ,"#3B528BFF", "#440154FF")) +
+    theme_light()+
+    theme(legend.position='none')+
+    theme(axis.text.y=element_blank())
+p4
+#ggsave("graphs/duty_vs_length.png",width=8,height=5)
+```
+
+```{r}
+legend<-get_legend(p1)
+p1<-p1+theme(legend.position = "none")
+p2<-p2+labs(x="")+theme(axis.ticks.y=element_blank())
+p4<-p4+labs(x="")+theme(axis.ticks.y=element_blank())
+ggdraw(plot_grid(plot_grid(p1, p2,p3,p4, ncol=2, align='v'),
+    plot_grid(NULL, legend, ncol=1),
+    rel_widths=c(1, 0.3)))
+ggsave("fourvars_vs_duty.png",width=10,height=8)
+```
+##belt_strength_kNpm
+```{r}
+
+p5<-ggplot(data=expvars,aes(x=conveyor_duty,y=belt_strength_kNpm))+
+    labs(x="Conveyor Duty", y="Belt Strength in kN/m")+
+    geom_violin(aes(colour=conveyor_duty))+
+    geom_jitter(aes(colour=conveyor_duty),position=position_jitter(0.1))+
+    coord_flip()+
+    scale_color_manual(values=c("#FDE725FF", "#5DC863FF", "#21908CFF" ,"#3B528BFF", "#440154FF")) +
+    theme_light()+
+    theme(legend.position='none')+
+    theme(axis.text.y=element_blank())
+p5
+#ggsave("graphs/duty_vs_strength.png",width=8,height=5)
+```
+##drop_height_m
+
+```{r}
+
+#drop_height_m
+p6<-ggplot(data=expvars,aes(x=conveyor_duty,y=drop_height_m))+
+    labs(x="Conveyor Duty", y="Drop Height in m")+
+    geom_violin(aes(colour=conveyor_duty))+
+    geom_jitter(aes(colour=conveyor_duty),position=position_jitter(0.1))+
+    coord_flip()+
+    scale_color_manual(values=c("#FDE725FF", "#5DC863FF", "#21908CFF" ,"#3B528BFF", "#440154FF")) +
+    theme_light()+
+    theme(legend.position='none')+
+    theme(axis.text.y=element_blank())
+p6
+#ggsave("graphs/duty_vs_dropHeight.png",width=8,height=5)
+```
+
+```{r}
+
+p5
+p6<-p6+labs(x="")+theme(axis.ticks.y=element_blank())
+ggdraw(plot_grid(plot_grid(p1, p2,p3,p4,p5,p6, ncol=2, align='v'),
+    plot_grid(NULL, legend, ncol=1),
+    rel_widths=c(1, 0.3)))
+#ggsave("graphs/sixvars_vs_duty.png",width=10,height=12)
+```
+## Percentage Fines
+```{r}
+
+
+#Percentage Fines
+p7<-ggplot(data=expvars,aes(x=conveyor_duty,y=perc_fines))+
+    labs(x="Conveyor Duty", y="% fines")+
+    geom_violin(aes(colour=conveyor_duty))+
+    geom_jitter(aes(colour=conveyor_duty),position=position_jitter(0.1))+
+    coord_flip()+
+    scale_color_manual(values=c("#FDE725FF", "#5DC863FF", "#21908CFF" ,"#3B528BFF", "#440154FF")) +
+    theme_light()+
+    theme(legend.position='none')+
+    theme(axis.text.y=element_blank())
+
+```
+##Belt speed
+```{r}
+
+#Belt speed
+p8<-ggplot(data=expvars,aes(x=conveyor_duty,y=belt_speed_ms))+
+    labs(x="", y="Belt Speed in m/s")+
+    geom_violin(aes(colour=conveyor_duty))+
+    geom_jitter(aes(colour=conveyor_duty),position=position_jitter(0.1))+
+    coord_flip()+
+    scale_color_manual(values=c("#FDE725FF", "#5DC863FF", "#21908CFF" ,"#3B528BFF", "#440154FF")) +
+    theme_light()+
+    theme(legend.position='none')+
+    theme(axis.text.y=element_blank())
+    
+p8
+#ggsave("graphs/duty_vs_speed.png",width=8,height=5)
+
+```
+##All graphs - Figure 7
+```{r}
+#Combined plot
+
+ggdraw(plot_grid(
+                plot_grid(p1,p2,p3,p4,p5,p6,p7,p8,ncol=2,align='v'),
+                plot_grid(legend,ncol=1),ncol=1,align='none',rel_heights = c(8,1)))
+
+ggsave("../../graphs/Figure7.png",width=10,height=16)
+
+
+```
+
+#Show underlying fits to the data
+
+Unfortunately, we need to repeat the modelling to get the distribution of model fits as we don't return the entire set of model fits from the lower level code.
+
+```{r}
+
+wear_fits_global <- wear_data %>%
+    group_by(pool, position) %>%
+    do(fit_time = lm(thickness_mm ~ weeks, data = .),
+       fit_tonnes = lm(thickness_mm ~ Mt_total_cum, data = .)) 
+  
+wear_rates_global <- wear_fits_global %>%
+    gather(metric, fit, fit_time, fit_tonnes) %>%
+    rowwise() %>%
+    mutate(fit_rank = fit$rank) %>%
+    filter(fit_rank == 2) %>% # remove models that aren't of full rank
+    mutate(coef_name = names(fit$coefficients)[[2]],
+           rate = -1 * fit$coefficients[[coef_name]],
+           r2 = broom::glance(fit)$r.squared,
+           std_err = broom::tidy(fit) %>%
+             filter(term == coef_name) %>%
+             pull(std.error)) %>%
+    select(pool, position, metric, rate, r2, std_err) %>%
+    ungroup()
+  
+datafits<-wear_rates_global %>%
+     select(-c("pool","position")) %>%
+     group_by(metric) 
+  
+
+datafits_output<-summarise(datafits,
+                Expected_R2=mean(r2),
+                std_dev_R2=sqrt(var(r2)),
+                mean_error=mean(std_err),
+                std_dev_stderror=sqrt(var(std_err)))
+
+```
+
+## Figure 4
+```{r}
+datafits_output
+
+fitplot <- ggplot(wear_rates_mean,aes(x=rate, colour=metric, fill=metric)) + facet_wrap(.~metric,scales="free") + geom_histogram(bins=50, show.legend = FALSE, alpha=0.8) + theme_bw() + 
+    scale_color_viridis_d() + scale_fill_viridis_d() 
+
+
+fitplot
+ggsave("../../graphs/Figure4.png",width=5,height=4)
+
+```
+
+##Figure 5
+```{r}
+a<-ggplot(data=datafits,aes(x=r2,colour=metric,fill=metric))+labs(title="Spread of Fits",x="R Squared Value",y="Number of pool-width fits")+ theme_light()+ geom_histogram(bins=20,alpha=0.8)+facet_grid(metric~.) + geom_vline(xintercept=0.8,col="blue") +
+    scale_color_viridis_d() + scale_fill_viridis_d()
+
+a
+ggsave("../../graphs/Figure5.png",width=5,height=4)
+
+
+
+```
+
+#How many good/bad datafits do we have?
+
+```{r}
+
+poortimefits<-datafits %>%
+    filter(metric=="fit_time") %>%
+    filter(r2<=0.5) %>%
+    summarise(n=n()/3229)
+
+
+poortonnesfits <-datafits %>%
+    filter(metric!="fit_time") %>%
+    filter(r2<=0.5) %>%
+    summarise(n=n()/3229)  
+    
+
+goodtimefits<-datafits %>%
+    filter(metric=="fit_time") %>%
+    filter(r2>=0.8) %>%
+    summarise(n=n()/3229)
+
+
+goodtonnesfits <-datafits %>%
+    filter(metric!="fit_time") %>%
+    filter(r2>=0.8) %>%
+    summarise(n=n()/3229)  
+
+paste0("% time fits <=0.2 : ", poortimefits$n)
+paste0("% tonnes fits <=0.2 : ", poortonnesfits$n)
+paste0("% time fits >=0.8 : ", goodtimefits$n)
+paste0("% tonnes fits >=0.8 : ", goodtonnesfits$n)
+
+```
+
+
+```{r, include = FALSE}
+# This code chunk renders a visual summary of each conveyor pool, and will fail if you attempt to run it directly,
+# it is only meant to be run when knitting (through the Knit button or rmarkdown::render)
+conveyors <- unique(wear_data$conveyor_id)
+pools <- purrr::map(conveyors, ~ unique(filter(wear_data, conveyor_id == .x)$pool)) %>%
+  set_names(conveyors)
+
+out <- NULL
+
+for (conveyor_id in names(pools)) {
+  out <- c(out, paste0("### ", conveyor_id)) 
+  for (pool_id in pools[[conveyor_id]]) {
+    out <- c(out, knit_child("pool-summary-template.Rmd", envir = parent.frame()))
+  }
+}
+```
+
+`r paste(knit(text = out), collapse = "\n")`
+
+
